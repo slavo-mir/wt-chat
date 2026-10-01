@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>~</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap">
+<style>
+  * { border-radius: 0; }
+  html, body { height: 100%; margin: 0; background: #000; color: #fff; cursor: default; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+  body { font: 16px/1.8 "Press Start 2P", monospace; padding: 12px; }
+  @media (max-width: 600px) { body { font-size: 12px; } }
+  #term { height: 100%; overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere; scrollbar-width: none; }
+  #term::-webkit-scrollbar { display: none; }
+  #cmd { position: relative; }
+  #msg { position: absolute; inset: 0; width: 100%; opacity: 0; font-size: 16px; pointer-events: none; }
+  #cur { background: #fff; color: #000; animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { background: none; color: #fff; } }
+  .s { color: #888; }
+  img { display: block; max-width: 100%; max-height: 40vh; margin: 6px 0; }
+</style>
+
+<div id="term"><div id="cmd"><span id="pr"></span><span id="bf"></span><span id="cur"></span><span id="af"></span><input id="msg" maxlength="1000" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-lpignore="true" data-1p-ignore autofocus></div></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+<script>
+const URL_ = "https://osqsbpceibmqjntwayjk.supabase.co";
+const KEY_ = "sb_publishable_d6hxrRwZcXPbDW_0Zc2LOg_xAGsr4Gr";
+
+const te = new TextEncoder(), td = new TextDecoder();
+const b64 = b => btoa(String.fromCharCode(...new Uint8Array(b)));
+const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+const hex = b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, "0")).join("");
+const labels = ["nick", "room", "pass"], vals = [], seen = new Set();
+let step = 0, masked = false, timer, db, roomId, key, nick, room, lastId = 0, ps = "nick: ";
+
+const down = () => term.scrollTop = term.scrollHeight;
+const clear = () => document.querySelectorAll("#term > div:not(#cmd)").forEach(d => d.remove());
+
+function line(text, cls, img) {
+  const d = document.createElement("div");
+  d.textContent = text;
+  if (cls) d.className = cls;
+  if (img) { const i = new Image(); i.src = img; i.onload = down; d.append(i); }
+  term.insertBefore(d, cmd);
+  down();
+}
+
+function draw() {
+  const v = masked ? "*".repeat(msg.value.length) : msg.value, p = msg.selectionStart;
+  pr.textContent = ps;
+  bf.textContent = v.slice(0, p);
+  cur.textContent = v[p] || " ";
+  af.textContent = v.slice(p + 1);
+  down();
+}
+
+["input", "keyup", "focus"].forEach(e => msg.addEventListener(e, draw));
+document.addEventListener("selectionchange", draw);
+document.addEventListener("mousedown", e => { e.preventDefault(); msg.focus(); });
+document.addEventListener("click", () => msg.focus());
+
+async function post(o) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const data = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, te.encode(JSON.stringify(o)));
+  const { error } = await db.from("messages").insert({ room: roomId, iv: b64(iv), data: b64(data) });
+  if (error) line("error: " + error.message, "s"); else poll();
+}
+
+async function show(r) {
+  if (seen.has(r.id)) return;
+  seen.add(r.id);
+  lastId = Math.max(lastId, r.id);
+  try {
+    const m = JSON.parse(td.decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64(r.iv) }, key, unb64(r.data))));
+    const who = m.nick + "@" + room + " ~> ";
+    if (m.text) line(who + m.text);
+    else if (/^data:image\//.test(m.img)) line(who, "", m.img);
+
+    if (m.nick !== nick && "Notification" in window && Notification.permission === "granted") {
+      if (document.hidden) {
+        new Notification(`${m.nick} @ ${room}`, { body: m.text ? m.text : "Odoslal/a obrázok 📷" });
+      }
+    }
+  } catch (e) {}
+}
+
+async function poll() {
+  const { data } = await db.from("messages").select("*").eq("room", roomId).gt("id", lastId).order("id").limit(300);
+  for (const r of data || []) await show(r);
+}
+
+async function connect() {
+  [nick, room] = vals;
+  const pass = vals[2];
+  const base = await crypto.subtle.importKey("raw", te.encode(pass), "PBKDF2", false, ["deriveKey"]);
+  key = await crypto.subtle.deriveKey({ name: "PBKDF2", salt: te.encode("chat:" + room), iterations: 150000, hash: "SHA-256" },
+    base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+  roomId = hex(await crypto.subtle.digest("SHA-256", te.encode(room + "|" + pass))).slice(0, 32);
+  db = supabase.createClient(URL_, KEY_);
+  lastId = 0;
+  seen.clear();
+  ps = nick + "@" + room + " ~> ";
+  clear();
+  line("привет ~", "s");
+
+  if ("Notification" in window && Notification.permission !== "granted" && Notification.permission !== "denied") {
+    Notification.requestPermission();
+  }
+
+  await poll();
+  db.channel("r" + roomId)
+    .on("postgres_changes", { event: "INSERT", schema: "public", table: "messages", filter: "room=eq." + roomId }, p => show(p.new))
+    .subscribe();
+  timer = setInterval(poll, 3000);
+}
+
+function exit() {
+  clearInterval(timer);
+  db.removeAllChannels();
+  clear();
+  vals.length = 0;
+  key = null;
+  step = 0;
+  masked = false;
+  ps = "nick: ";
+}
+
+function pick() {
+  const f = document.createElement("input");
+  f.type = "file";
+  f.accept = "image/*";
+  f.onchange = async () => {
+    try {
+      const b = await createImageBitmap(f.files[0]), s = Math.min(1, 800 / Math.max(b.width, b.height));
+      const c = document.createElement("canvas");
+      c.width = b.width * s;
+      c.height = b.height * s;
+      c.getContext("2d").drawImage(b, 0, 0, c.width, c.height);
+      post({ nick, img: c.toDataURL("image/jpeg", 0.6) });
+    } catch (e) { line("error: image", "s"); }
+  };
+  f.click();
+}
+
+msg.addEventListener("keydown", async e => {
+  if (e.key != "Enter") return;
+  e.preventDefault();
+  const t = msg.value.trim();
+  msg.value = "";
+  if (!t) return draw();
+  if (step < 3) {
+    vals[step] = t;
+    if (step < 2) line(labels[step] + ": " + t);
+    step++;
+    masked = step == 2;
+    ps = step < 3 ? labels[step] + ": " : "";
+    if (step == 3) await connect();
+  } else if (t == "/exit") exit();
+  else if (t == "/image") pick();
+  else await post({ nick, text: t });
+  draw();
+});
+
+draw();
+</script>
